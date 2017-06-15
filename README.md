@@ -1,9 +1,10 @@
-##abstract
- RCBW , called the reservation of CPU bandwidth,  is  a management-mechanism for CPU resources  that exploits the original completely fair scheduler to guarantee the runtime of specific groups of processes.
+###abstract
+ 
+RCBW , called the reservation of CPU bandwidth,  is  a management-mechanism for CPU resources  that exploits the original completely fair scheduler to guarantee the runtime of specific groups of processes.
  
 The CPU QoS (Quality of Service) ensures optimal allocation of  computing resources for users and prevents resource contention among users. At process level, CPU limit and quota have already been supported on CFS, but CPU reservation is not supported yet. Here the CPU limit is the maximum CPU resources  available to groups of processes. 
  
-##usage
+###usage
 
 Step 1 : To build the kernel with RCBW enabled, the following option must be enabled.
 ~~~
