@@ -1,15 +1,15 @@
-From 8f8faef827d21e456f7c81a46367d8216238a8b1 Mon Sep 17 00:00:00 2001
+From 5f7aec1624c11321bdde0e328f8d1d15bc593672 Mon Sep 17 00:00:00 2001
 From: Yupeng Li <koalalyplcy@gmail.com>
-Date: Wed, 14 Jun 2017 10:45:28 +0800
-Subject: [PATCH] patch 4.4
+Date: Sat, 24 Jun 2017 18:12:28 +0800
+Subject: [PATCH] update
 
 ---
  include/linux/sched.h |   5 +
  init/Kconfig          |  13 +
  kernel/sched/core.c   | 302 +++++++++++++++++++++-
- kernel/sched/fair.c   | 700 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ kernel/sched/fair.c   | 701 +++++++++++++++++++++++++++++++++++++++++++++++++-
  kernel/sched/sched.h  |  41 +++
- 5 files changed, 1044 insertions(+), 17 deletions(-)
+ 5 files changed, 1045 insertions(+), 17 deletions(-)
 
 diff --git a/include/linux/sched.h b/include/linux/sched.h
 index fa39434..9387dc7 100644
@@ -405,7 +405,7 @@ index 732e993..2632164 100644
  #ifdef CONFIG_RT_GROUP_SCHED
  	{
 diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
-index cfdc0e6..0a09e3e 100644
+index cfdc0e6..1654c5c 100644
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
 @@ -426,6 +426,8 @@ find_matching_se(struct sched_entity **se, struct sched_entity **pse)
@@ -519,21 +519,29 @@ index cfdc0e6..0a09e3e 100644
  
  /*
   * Pick the next process, keeping these things in mind, in this order:
-@@ -3208,6 +3239,13 @@ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+@@ -3208,6 +3239,9 @@ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
  {
  	struct sched_entity *left = __pick_first_entity(cfs_rq);
  	struct sched_entity *se;
 +#ifdef CONFIG_CFS_BANDWIDTH_RESERVE
 +    struct sched_entity *reserve_left;
-+
-+    reserve_left = __pick_first_reserve_entity(cfs_rq);
-+    if (reserve_left) 
-+        return reserve_left;
 +#endif
  
  	/*
  	 * If curr is set we have to see if its left of the leftmost entity
-@@ -3267,12 +3305,18 @@ static void put_prev_entity(struct cfs_rq *cfs_rq, struct sched_entity *prev)
+@@ -3237,6 +3271,11 @@ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 			se = second;
+ 	}
+ 
++#ifdef CONFIG_CFS_BANDWIDTH_RESERVE
++    reserve_left = __pick_first_reserve_entity(cfs_rq);
++    if (reserve_left) 
++        se = reserve_left;
++#endif
+ 	/*
+ 	 * Prefer last buddy, try to return the CPU to a preempted task.
+ 	 */
+@@ -3267,12 +3306,18 @@ static void put_prev_entity(struct cfs_rq *cfs_rq, struct sched_entity *prev)
  
  	/* throttle cfs_rqs exceeding runtime */
  	check_cfs_rq_runtime(cfs_rq);
@@ -553,7 +561,7 @@ index cfdc0e6..0a09e3e 100644
  		/* in !on_rq case, update occurred at dequeue */
  		update_load_avg(prev, 0);
  	}
-@@ -3309,8 +3353,8 @@ entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
+@@ -3309,8 +3354,8 @@ entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
  			hrtimer_active(&rq_of(cfs_rq)->hrtick_timer))
  		return;
  #endif
@@ -564,7 +572,7 @@ index cfdc0e6..0a09e3e 100644
  		check_preempt_tick(cfs_rq, curr);
  }
  
-@@ -3926,6 +3970,11 @@ static enum hrtimer_restart sched_cfs_slack_timer(struct hrtimer *timer)
+@@ -3926,6 +3971,11 @@ static enum hrtimer_restart sched_cfs_slack_timer(struct hrtimer *timer)
  	struct cfs_bandwidth *cfs_b =
  		container_of(timer, struct cfs_bandwidth, slack_timer);
  
@@ -576,7 +584,7 @@ index cfdc0e6..0a09e3e 100644
  	do_sched_cfs_slack_timer(cfs_b);
  
  	return HRTIMER_NORESTART;
-@@ -3939,6 +3988,12 @@ static enum hrtimer_restart sched_cfs_period_timer(struct hrtimer *timer)
+@@ -3939,6 +3989,12 @@ static enum hrtimer_restart sched_cfs_period_timer(struct hrtimer *timer)
  	int idle = 0;
  
  	raw_spin_lock(&cfs_b->lock);
@@ -589,7 +597,7 @@ index cfdc0e6..0a09e3e 100644
  	for (;;) {
  		overrun = hrtimer_forward_now(timer, cfs_b->period);
  		if (!overrun)
-@@ -3965,12 +4020,16 @@ void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+@@ -3965,12 +4021,16 @@ void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
  	cfs_b->period_timer.function = sched_cfs_period_timer;
  	hrtimer_init(&cfs_b->slack_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
  	cfs_b->slack_timer.function = sched_cfs_slack_timer;
@@ -606,7 +614,7 @@ index cfdc0e6..0a09e3e 100644
  }
  
  void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
-@@ -4031,6 +4090,595 @@ static void __maybe_unused unthrottle_offline_cfs_rqs(struct rq *rq)
+@@ -4031,6 +4091,595 @@ static void __maybe_unused unthrottle_offline_cfs_rqs(struct rq *rq)
  	}
  }
  
@@ -1202,7 +1210,7 @@ index cfdc0e6..0a09e3e 100644
  #else /* CONFIG_CFS_BANDWIDTH */
  static inline u64 cfs_rq_clock_task(struct cfs_rq *cfs_rq)
  {
-@@ -4151,6 +4799,10 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+@@ -4151,6 +4800,10 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
  		*/
  		if (cfs_rq_throttled(cfs_rq))
  			break;
@@ -1213,7 +1221,7 @@ index cfdc0e6..0a09e3e 100644
  		cfs_rq->h_nr_running++;
  
  		flags = ENQUEUE_WAKEUP;
-@@ -4158,11 +4810,14 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+@@ -4158,11 +4811,14 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
  
  	for_each_sched_entity(se) {
  		cfs_rq = cfs_rq_of(se);
@@ -1231,7 +1239,7 @@ index cfdc0e6..0a09e3e 100644
  		update_load_avg(se, 1);
  		update_cfs_shares(cfs_rq);
  	}
-@@ -4190,6 +4845,8 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+@@ -4190,6 +4846,8 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
  		cfs_rq = cfs_rq_of(se);
  		dequeue_entity(cfs_rq, se, flags);
  
@@ -1240,7 +1248,7 @@ index cfdc0e6..0a09e3e 100644
  		/*
  		 * end evaluation on encountering a throttled cfs_rq
  		 *
-@@ -4220,6 +4877,9 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+@@ -4220,6 +4878,9 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
  		cfs_rq = cfs_rq_of(se);
  		cfs_rq->h_nr_running--;
  
@@ -1250,7 +1258,7 @@ index cfdc0e6..0a09e3e 100644
  		if (cfs_rq_throttled(cfs_rq))
  			break;
  
-@@ -5243,9 +5903,18 @@ again:
+@@ -5243,9 +5904,18 @@ again:
  				goto simple;
  		}
  
@@ -1271,7 +1279,7 @@ index cfdc0e6..0a09e3e 100644
  
  	p = task_of(se);
  
-@@ -8094,7 +8763,9 @@ void free_fair_sched_group(struct task_group *tg)
+@@ -8094,7 +8764,9 @@ void free_fair_sched_group(struct task_group *tg)
  	int i;
  
  	destroy_cfs_bandwidth(tg_cfs_bandwidth(tg));
@@ -1282,7 +1290,7 @@ index cfdc0e6..0a09e3e 100644
  	for_each_possible_cpu(i) {
  		if (tg->cfs_rq)
  			kfree(tg->cfs_rq[i]);
-@@ -8105,6 +8776,7 @@ void free_fair_sched_group(struct task_group *tg)
+@@ -8105,6 +8777,7 @@ void free_fair_sched_group(struct task_group *tg)
  		}
  	}
  
