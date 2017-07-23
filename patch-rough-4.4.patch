@@ -1,15 +1,16 @@
-From 5f7aec1624c11321bdde0e328f8d1d15bc593672 Mon Sep 17 00:00:00 2001
-From: Yupeng Li <koalalyplcy@gmail.com>
-Date: Sat, 24 Jun 2017 18:12:28 +0800
-Subject: [PATCH] update
+From c454468125846554c1ee8292c4a4f37491c265ee Mon Sep 17 00:00:00 2001
+From: Yupeng Li <ypli15@lzu.edu.cn>
+Date: Sun, 23 Jul 2017 23:10:43 +0800
+Subject: [PATCH] Update RCBW patch for linux-4.4 kernel
 
+Signed-off-by: Yupeng Li <ypli15@lzu.edu.cn>
 ---
  include/linux/sched.h |   5 +
- init/Kconfig          |  13 +
+ init/Kconfig          |  15 ++
  kernel/sched/core.c   | 302 +++++++++++++++++++++-
  kernel/sched/fair.c   | 701 +++++++++++++++++++++++++++++++++++++++++++++++++-
  kernel/sched/sched.h  |  41 +++
- 5 files changed, 1045 insertions(+), 17 deletions(-)
+ 5 files changed, 1047 insertions(+), 17 deletions(-)
 
 diff --git a/include/linux/sched.h b/include/linux/sched.h
 index fa39434..9387dc7 100644
@@ -28,25 +29,27 @@ index fa39434..9387dc7 100644
  
  #ifdef CONFIG_SMP
 diff --git a/init/Kconfig b/init/Kconfig
-index 235c7a2..ef43e43 100644
+index 235c7a2..038140f 100644
 --- a/init/Kconfig
 +++ b/init/Kconfig
-@@ -1103,6 +1103,19 @@ config CFS_BANDWIDTH
+@@ -1103,6 +1103,21 @@ config CFS_BANDWIDTH
  	  restriction.
  	  See tip/Documentation/scheduler/sched-bwc.txt for more information.
  
 +config CFS_BANDWIDTH_RESERVE
-+    bool "the processes obtain minimum CPU bandwidth"
-+    depends on CFS_BANDWIDTH
++    bool "RCBW---The reservation of CPU bandwidth"
++    depends on !SMP && CFS_BANDWIDTH
 +    default n
 +    help
-+        This option allows processer allows to obtain minimizes CPU
-+        bandwidth in per period 
++        This option guarantees the runtime of a specific group of processes
++        when the group contend CPU resources with others.
 +
 +config RESERVE_DEBUG_INFO
-+    bool "See the information about reserve queue through Sysfs"
++    bool "See some debug information about RCBW through Sysfs"
 +    depends on CFS_BANDWIDTH_RESERVE
 +    default n
++    help
++        See some debug information about RCBW throught Sysfs
 +
  config RT_GROUP_SCHED
  	bool "Group scheduling for SCHED_RR/FIFO"
@@ -1375,5 +1378,5 @@ index b242775..c724390 100644
  #endif /* CONFIG_FAIR_GROUP_SCHED */
  };
 -- 
-2.1.4
+2.7.4
 
