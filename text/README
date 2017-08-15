@@ -1,0 +1,5 @@
+This program forks 10 times in the group marked by reservation to measure the overhead of reservation. 
+The result is that execution time is too long compared with the mainline. The reason why execution times
+is too long is that the reservation group transforms between the origin running queue and the reservation 
+priority queue when the system manager writes the interface of reservation in CPU control sub-system every
+time. it's a fatal bug.
