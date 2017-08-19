@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <time.h>
+#include <sched.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -29,42 +30,36 @@ const char *interface_share = "/cpu.shares";
 const char *interface_quota = "/cpu.cfs_quota_us";
 const char *interface_reserve = "/cpu.cfs_reserve_us";
 
-void write_opt(char *grp, const char *interface, char *bufval)
+
+void write_opt(char *grp, const char *interface)
 {
     int fd, reval = 0;
     struct timeval start, end;
     char path[1024] = {0};
-    int lenbasedir = strlen(basedir), lengrp = strlen(grp);
+    char bufval[10];
 
-    strcpy(path, basedir);
-    strcat(path, grp);
-    strcat(path, interface);
-/*
+    if (!grp) {
+        strcpy(path, interface);
+        strcpy(bufval, "1024");
+       // printf("shares: %s, val : %s\n", path, bufval);
+    } else {
+        strcpy(path, basedir);
+        strcat(path, grp);
+        strcat(path, interface);
+        strcpy(bufval, "40000");
+       // printf("reserve: %s, val: %s\n", path, bufval);
+    }
+    
+
     fd = open(path, O_RDWR);
     if (fd == -1) {
         printf("Cann't open this file : %s\n", path);
         return ;
     }
-
-    gettimeofday(&start, NULL);
-    if (!bufval)
-        reval = write(fd, "30000", strlen("30000"));
-    else
-        reval = write(fd, "40000", strlen("40000"));
+        
+    gettimeofday(&start, NULL);    
+    reval = write(fd, bufval, strlen(bufval));
     gettimeofday(&end, NULL);
-*/
-
-    if (!bufval) {
-        fd = open("/sys/fs/cgroup/cpu/part2/cpu.cfs_quota_us", O_RDWR);
-        gettimeofday(&start, NULL);
-        reval = write(fd, "30000", strlen("30000"));
-        gettimeofday(&end, NULL);
-    } else {
-        fd = open(path, O_RDWR);
-        gettimeofday(&start, NULL);
-        reval = write(fd, "40000", strlen("40000"));
-        gettimeofday(&end, NULL);
-    }
 
     cal_time(&start, &end);
     
@@ -77,21 +72,23 @@ int main(int argc, char **args)
 {
     int randval = 0;
     char buf[10];
+    const char *compared_path = "/sys/fs/cgroup/cpu/part2/cpu.cfs_quota_us";
+    struct sched_param child_param;
+    pid_t pid;
 
     if (argc < 1) {
         printf("Missing parameters in child process!\n");
         return 0;
     }
 
-    write_opt(args[0], interface_quota, NULL);
+    child_param.sched_priority = 19;
+    pid = getpid();
 
-    srand((unsigned int)time(NULL));
-    do{
-        randval = rand() % 10;
-    }while (randval < 3);
+    sched_setscheduler(pid, SCHED_FIFO, &child_param);
 
-    sprintf(buf, "%d", randval * SEC_TO_MSEC / 100);
-    write_opt(args[0], interface_reserve, buf);
+    write_opt(NULL, compared_path);
+    write_opt(args[0], interface_reserve);
+    
     printf("\n");
     return 0;
 }
