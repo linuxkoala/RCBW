@@ -1,11 +1,11 @@
-###Abstract
+### Abstract
 <hr />
 
 RCBW, called as the Reservation of CPU Bandwidth, is a kernel-level CPU resources manager that exploits the original
 CFS to guarantee the runtime of speciic groups of processes when other groups compete CPU resources.
 
 
-###Source code
+### Source code
 <hr />
 Before we start to study this topic, CPU controller subsystem had not been merged into the mainline of cgroup-v2. Therefore, we choose a LTS version - Linux-4.4.
 
@@ -22,7 +22,7 @@ CONFIG_CFS_BANDWIDTH_RESERVE = y
 CONFIG_RESERVE_DEBUG_INFO = y
 ~~~
 
-###Usage
+### Usage
 <hr />
 
 Step 1: cgroup 	partition setting.
