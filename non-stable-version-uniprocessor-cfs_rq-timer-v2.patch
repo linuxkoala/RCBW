@@ -1,0 +1,1482 @@
+From 0ac3a0fe370952bdec44422dda31935091b74779 Mon Sep 17 00:00:00 2001
+From: Yupeng Li <ypli15@lzu.edu.cn>
+Date: Wed, 24 Jan 2018 15:30:47 +0800
+Subject: [PATCH] stable-version-cfs_rq-timer-v2
+
+Signed-off-by: Yupeng Li <ypli15@lzu.edu.cn>
+---
+ include/linux/sched.h |   6 +
+ init/Kconfig          |   9 +
+ kernel/sched/core.c   | 320 ++++++++++++++++++++
+ kernel/sched/fair.c   | 804 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ kernel/sched/sched.h  |  39 +++
+ 5 files changed, 1177 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index fa39434..e9aa69f 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1265,6 +1265,12 @@ struct sched_entity {
+ 	struct cfs_rq		*cfs_rq;
+ 	/* rq "owned" by this entity/group: */
+ 	struct cfs_rq		*my_q;
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++	struct rb_node reserve_node;
++	unsigned int reserve_on_rq;
++
++	unsigned int enqueue_mode;
++#endif
+ #endif
+ 
+ #ifdef CONFIG_SMP
+diff --git a/init/Kconfig b/init/Kconfig
+index 235c7a2..0924dc8 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1103,6 +1103,15 @@ config CFS_BANDWIDTH
+ 	  restriction.
+ 	  See tip/Documentation/scheduler/sched-bwc.txt for more information.
+ 
++config CFS_RESERVED_BANDWIDTH
++        bool "RCBW---The reservation of CPU bandwidth"
++        depends on CFS_BANDWIDTH
++        default n
++        help
++            This option guarantees precisely the runtime of a specific group of 
++            processes reguardless of other groups or processes contending CPU 
++            resources with this group.
++
+ config RT_GROUP_SCHED
+ 	bool "Group scheduling for SCHED_RR/FIFO"
+ 	depends on CGROUP_SCHED
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 732e993..1fbab22 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -8291,6 +8291,10 @@ const u64 min_cfs_quota_period = 1 * NSEC_PER_MSEC; /* 1ms */
+ 
+ static int __cfs_schedulable(struct task_group *tg, u64 period, u64 runtime);
+ 
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++static int check_quota_reserve(long reserve, struct task_group *tg);
++#endif
++
+ static int tg_set_cfs_bandwidth(struct task_group *tg, u64 period, u64 quota)
+ {
+ 	int i, ret = 0, runtime_enabled, runtime_was_enabled;
+@@ -8333,9 +8337,22 @@ static int tg_set_cfs_bandwidth(struct task_group *tg, u64 period, u64 quota)
+ 	 */
+ 	if (runtime_enabled && !runtime_was_enabled)
+ 		cfs_bandwidth_usage_inc();
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++	if (cfs_b->reserve_enabled && !runtime_enabled)
++		return -EINVAL;
++#endif
+ 	raw_spin_lock_irq(&cfs_b->lock);
+ 	cfs_b->period = ns_to_ktime(period);
+ 	cfs_b->quota = quota;
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++	if (cfs_reserve_bandwidth_used() && cfs_b->reserve_enabled) {
++		if (!check_quota_reserve(cfs_b->reserve, tg))
++			ret = -EINVAL;
++
++		raw_spin_unlock(&cfs_b->lock);
++		goto out_check;
++	}
++#endif
+ 
+ 	__refill_cfs_bandwidth_runtime(cfs_b);
+ 	/* restart the period timer (if active) to handle new period expiry */
+@@ -8355,6 +8372,7 @@ static int tg_set_cfs_bandwidth(struct task_group *tg, u64 period, u64 quota)
+ 			unthrottle_cfs_rq(cfs_rq);
+ 		raw_spin_unlock_irq(&rq->lock);
+ 	}
++out_check:
+ 	if (runtime_was_enabled && !runtime_enabled)
+ 		cfs_bandwidth_usage_dec();
+ out_unlock:
+@@ -8523,6 +8541,292 @@ static int cpu_stats_show(struct seq_file *sf, void *v)
+ 
+ 	return 0;
+ }
++
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++
++const u64 max_cfs_reserve_period = 1 * NSEC_PER_SEC; /* 1s */
++const u64 min_cfs_reserve_period = 1 * NSEC_PER_MSEC; /* 1ms */
++
++static DEFINE_MUTEX(cfs_reserve_constraints_mutex);
++
++long tg_get_cfs_reserve(struct task_group *tg);
++long tg_get_cfs_reserve_period(struct task_group *tg);
++
++struct cfs_reserve_schedulable_data {
++	struct task_group *tg;
++	u64 reserve_period;
++	u64 reserve;
++};
++
++static int tg_reserve_down(struct task_group *tg, void *d)
++{
++	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++
++	if (tg == &root_task_group) 
++		cfs_b->normalize_reserve = to_ratio(1,1);
++
++	return 0;
++}
++
++/* the unit of reserve is us */
++static int check_quota_reserve(long reserve, struct task_group *tg)
++{
++	long quota, reserve_period, period;
++
++	if (reserve == RESERVE_INF)
++		return 0;
++
++	period = tg_get_cfs_period(tg);
++	quota = tg_get_cfs_quota(tg);
++	reserve_period = tg_get_cfs_reserve_period(tg);
++	do_div(reserve, NSEC_PER_USEC);
++
++	return reserve * period > quota * reserve_period;
++}
++
++static u64 normalize_cfs_reserve(struct task_group *tg,
++                struct cfs_reserve_schedulable_data *data)
++{
++	u64 reserve, reserve_period;
++
++	if (tg == data->tg) {
++		reserve = data->reserve;
++		reserve_period = data->reserve_period;
++	} else {
++		reserve = tg_get_cfs_reserve(tg);
++		reserve_period = tg_get_cfs_reserve_period(tg);
++	}
++
++	/*
++	 * the former is reserve in data and the latter is reserve, returned
++	 * by tg_get_cfs_reserve()
++	 */
++	if (reserve == RESERVE_INF || reserve == -1)
++		return RESERVE_INF;
++
++	return to_ratio(reserve_period, reserve);
++}
++
++static int tg_reserve_up(struct task_group *tg, void *d)
++{
++	struct cfs_reserve_schedulable_data *data = 
++				(struct cfs_reserve_schedulable_data *)d;
++	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++	struct cfs_bandwidth *parent_b = &tg->parent->cfs_bandwidth;
++	u64 curr_reserve, prev_reserve;
++	u64 parent_total;
++
++	if (tg == &root_task_group)
++		return 0;
++
++	curr_reserve = normalize_cfs_reserve(tg, data);
++	if (curr_reserve == RESERVE_INF && cfs_b->total_children_reserve != 0) 
++		return -EINVAL;
++
++	if (curr_reserve == RESERVE_INF)
++		curr_reserve = 0;
++
++	prev_reserve = cfs_b->normalize_reserve;
++	parent_total = parent_b->total_children_reserve;
++	parent_total += curr_reserve - prev_reserve;
++
++	if (cfs_b->total_children_reserve > curr_reserve) 
++		return -EINVAL;
++
++	if (parent_total > parent_b->normalize_reserve) 
++		return -EINVAL;
++
++	parent_b->total_children_reserve = parent_total;
++	cfs_b->normalize_reserve = curr_reserve;
++
++	return 0;
++}
++
++
++static int __cfs_reserve_schedulable(struct task_group *tg,
++                u64 reserve, u64 reserve_period)
++{
++	int ret = 0;
++	struct cfs_reserve_schedulable_data data = {
++		.tg = tg,
++		.reserve_period = reserve_period,
++		.reserve = reserve,
++	};
++
++	if (reserve != RESERVE_INF) {
++		do_div(data.reserve_period, NSEC_PER_USEC);
++		do_div(data.reserve, NSEC_PER_USEC);
++	}
++
++	rcu_read_lock();
++	ret = walk_tg_tree(tg_reserve_down, tg_reserve_up, &data);
++	rcu_read_unlock();
++
++	return ret;
++}
++
++static int tg_set_cfs_reserved_bandwidth(struct task_group *tg,
++		u64 reserve_period, s64 reserve)
++{
++	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++	int ret = 0, reserve_runtime_enabled, reserve_runtime_was_enabled;
++	long quota = tg_get_cfs_quota(tg); /* ns */
++
++	if (tg == &root_task_group)
++		return -EINVAL;
++
++	if (quota < 0)
++		return -EPERM;
++
++	/* avoiding "short period" problem */
++	if (reserve_period < min_cfs_reserve_period || reserve_period > max_cfs_reserve_period) 
++		return -EINVAL;
++	/*
++	 * the value of reserve is so few that the frequency of context switch
++	 * increase significantly
++	 */
++	if (reserve < min_cfs_reserve_period)
++		return -EINVAL;
++
++	if (reserve > reserve_period && reserve != RESERVE_INF)
++		return -EINVAL;
++
++	get_online_cpus();
++	mutex_lock(&cfs_reserve_constraints_mutex);
++	ret = __cfs_reserve_schedulable(tg, reserve, reserve_period);
++	if(ret)
++		goto reserve_unlock;
++
++	reserve_runtime_enabled = check_quota_reserve(reserve, tg);
++	reserve_runtime_was_enabled = check_quota_reserve(tg->cfs_bandwidth.reserve, tg);
++
++	raw_spin_lock_irq(&cfs_b->lock);
++	cfs_b->reserve_enabled = reserve_runtime_enabled;
++	cfs_b->reserve = reserve;
++	cfs_b->reserve_period = ns_to_ktime(reserve_period);
++	raw_spin_unlock_irq(&cfs_b->lock);
++
++	if (reserve_runtime_enabled && !reserve_runtime_was_enabled) {
++		from_original_to_reserve(tg);
++		cfs_reserve_bandwidth_usage_inc();
++	}
++
++	if (!reserve_runtime_enabled && reserve_runtime_was_enabled) {
++		from_reserve_to_original(tg);
++		cfs_reserve_bandwidth_usage_dec();
++	}
++
++reserve_unlock:
++	mutex_unlock(&cfs_reserve_constraints_mutex);
++	put_online_cpus();
++
++	return ret;
++}
++
++int tg_set_cfs_reserve(struct task_group *tg, s64 cfs_reserve_us)
++{
++	u64 reserve, reserve_period;
++
++	reserve_period = ktime_to_ns(tg->cfs_bandwidth.reserve_period);
++	if (cfs_reserve_us < 0)
++		reserve = RESERVE_INF;
++	else
++		reserve = (u64)cfs_reserve_us * NSEC_PER_USEC;
++
++	return tg_set_cfs_reserved_bandwidth(tg, reserve_period, reserve);
++}
++
++long tg_get_cfs_reserve(struct task_group *tg)
++{
++	u64 reserve_us;
++
++	if (tg->cfs_bandwidth.reserve == RESERVE_INF)
++		return -1;
++
++	reserve_us = tg->cfs_bandwidth.reserve;
++	do_div(reserve_us, NSEC_PER_USEC);
++
++	return reserve_us;
++}
++
++static int cpu_cfs_reserve_write_s64(struct cgroup_subsys_state *css,
++		struct cftype *cftype, s64 cfs_reserve_us)
++{
++	return tg_set_cfs_reserve(css_tg(css), cfs_reserve_us);
++}
++
++static s64 cpu_cfs_reserve_read_s64(struct cgroup_subsys_state *css,
++                struct cftype *cft)
++{
++    return tg_get_cfs_reserve(css_tg(css));
++}
++
++
++int tg_set_cfs_reserve_period(struct task_group *tg, u64 cfs_reserve_period_us)
++{
++	u64 reserve, reserve_period;
++
++	reserve_period = (u64)cfs_reserve_period_us * NSEC_PER_USEC;
++	reserve = tg->cfs_bandwidth.reserve;
++
++	return tg_set_cfs_reserved_bandwidth(tg, reserve_period, reserve);
++}
++
++long tg_get_cfs_reserve_period(struct task_group *tg)
++{
++	u64 cfs_reserve_period_us;
++
++	cfs_reserve_period_us = ktime_to_ns(tg->cfs_bandwidth.reserve_period);
++	do_div(cfs_reserve_period_us, NSEC_PER_USEC);
++
++	return cfs_reserve_period_us;
++}
++
++static int cpu_cfs_reserve_period_write_u64(struct cgroup_subsys_state *css,
++		struct cftype *cftype, u64 cfs_reserve_period_us)
++{
++	return tg_set_cfs_reserve_period(css_tg(css), cfs_reserve_period_us);
++}
++
++static u64 cpu_cfs_reserve_period_read_u64(struct cgroup_subsys_state *css,
++					   struct cftype *cftype)
++{
++	return tg_get_cfs_reserve_period(css_tg(css));
++}
++
++static int sched_entity_info_show(struct seq_file *sf, void *v)
++{
++	struct task_group *tg = css_tg(seq_css(sf));
++	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++	struct sched_entity *se;
++	struct cfs_rq *cfs_rq;
++
++	se = tg->se[0];
++	cfs_rq = tg->cfs_rq[0];
++
++	if (se == NULL)
++		return 0;
++
++	seq_printf(sf, "se on_rq : %d\n", se->on_rq);
++	seq_printf(sf, "cfs_rq load.weight: %lu\n", cfs_rq->load.weight);
++	seq_printf(sf, "-----------------------------------------------\n");
++	seq_printf(sf, "cfs_rq enabled:%d\n", cfs_rq->runtime_enabled);
++	seq_printf(sf, "cfs_rq remaining :%ld\n", (long)cfs_rq->runtime_remaining);
++	seq_printf(sf, "cfs_rq throttled: %d\n", cfs_rq->throttled);
++	seq_printf(sf, "-----------------------------------------------\n");
++	seq_printf(sf, "cfs_b reserve list empty:%d\n", list_empty(&cfs_b->throttled_cfs_rq_reserve));
++	seq_printf(sf, "cfs_b reserve_enabled:%d\n", cfs_b->reserve_enabled);
++	seq_printf(sf, "-----------------------------------------------\n");
++	seq_printf(sf, "se reserve_on_rq : %d\n", se->reserve_on_rq);
++	seq_printf(sf, "cfs_rq inactive_count:%d\n", cfs_rq->inactive_count);
++	seq_printf(sf, "cfs_rq reserve remaining:%ld\n", (long)cfs_rq->reserve_remaining);
++	seq_printf(sf, "cfs_rq reserve_enabled:%d\n", cfs_rq->reserve_enabled);
++	seq_printf(sf, "cfs_rq reserve_throttled:%d\n", cfs_rq->reserve_throttled);
++
++	return 0;
++}
++
++#endif /* CONFIG_CFS_RESERVED_BANDWIDTH */
+ #endif /* CONFIG_CFS_BANDWIDTH */
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+ 
+@@ -8575,6 +8879,22 @@ static struct cftype cpu_files[] = {
+ 		.name = "stat",
+ 		.seq_show = cpu_stats_show,
+ 	},
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++	{	
++		.name = "sched_entity_info",
++		.seq_show = sched_entity_info_show,
++	},
++	{
++		.name = "cfs_reserve_period_us",
++		.read_u64 = cpu_cfs_reserve_period_read_u64,
++		.write_u64 = cpu_cfs_reserve_period_write_u64,
++	},
++	{
++		.name = "cfs_reserve_us",
++		.read_s64 = cpu_cfs_reserve_read_s64,
++		.write_s64 = cpu_cfs_reserve_write_s64,
++	},
++#endif
+ #endif
+ #ifdef CONFIG_RT_GROUP_SCHED
+ 	{
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index cfdc0e6..b4db73d 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -245,6 +245,29 @@ const struct sched_class fair_sched_class;
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++static struct sched_entity *__pick_first_reserve_entity(struct cfs_rq *cfs_rq);
++
++static void init_cfs_reserve_bandwidth(struct cfs_bandwidth *cfs_b);
++static void init_cfs_rq_reserve_runtime(struct cfs_rq *cfs_rq);
++
++static void check_enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags);
++static void check_dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se);
++static int check_reserve_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *se);
++static void check_enqueue_reserve_throttle(struct cfs_rq *cfs_rq);
++
++static bool check_cfs_rq_reserve_runtime(struct cfs_rq *cfs_rq);
++static inline int check_cfs_bandwidth_reserve_enabled(struct cfs_bandwidth *cfs_b);
++
++static inline int reserve_cfs_rq_throttled(struct cfs_rq *cfs_rq);
++
++static void unthrottle_reserve_cfs_rq(struct cfs_rq *cfs_rq);
++static void throttle_reserve_cfs_rq(struct cfs_rq *cfs_rq);
++
++static int start_cfs_rq_reserve_period_timer(struct cfs_rq *cfs_rq);
++static enum hrtimer_restart sched_cfs_rq_reserve_period_timer(struct hrtimer *timer);
++#endif
++
+ /* cpu runqueue to which this cfs_rq is attached */
+ static inline struct rq *rq_of(struct cfs_rq *cfs_rq)
+ {
+@@ -695,6 +718,8 @@ void init_entity_runnable_average(struct sched_entity *se)
+ }
+ #endif
+ 
++static void account_cfs_rq_reserve_runtime(struct cfs_rq *cfs_rq, u64 delta_exec);
++
+ /*
+  * Update the current task's runtime statistics.
+  */
+@@ -731,6 +756,7 @@ static void update_curr(struct cfs_rq *cfs_rq)
+ 	}
+ 
+ 	account_cfs_rq_runtime(cfs_rq, delta_exec);
++	account_cfs_rq_reserve_runtime(cfs_rq, delta_exec);
+ }
+ 
+ static void update_curr_fair(struct rq *rq)
+@@ -3021,12 +3047,19 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 	update_stats_enqueue(cfs_rq, se);
+ 	check_spread(cfs_rq, se);
+ 	if (se != cfs_rq->curr)
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++		check_enqueue_entity(cfs_rq, se, flags);
++#else
+ 		__enqueue_entity(cfs_rq, se);
++#endif
+ 	se->on_rq = 1;
+ 
+ 	if (cfs_rq->nr_running == 1) {
+ 		list_add_leaf_cfs_rq(cfs_rq);
+ 		check_enqueue_throttle(cfs_rq);
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++		check_enqueue_reserve_throttle(cfs_rq);
++#endif
+ 	}
+ }
+ 
+@@ -3103,7 +3136,11 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 	clear_buddies(cfs_rq, se);
+ 
+ 	if (se != cfs_rq->curr)
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++		check_dequeue_entity(cfs_rq, se);
++#else
+ 		__dequeue_entity(cfs_rq, se);
++#endif
+ 	se->on_rq = 0;
+ 	account_entity_dequeue(cfs_rq, se);
+ 
+@@ -3132,6 +3169,10 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 	struct sched_entity *se;
+ 	s64 delta;
+ 
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++	if (check_reserve_preempt_tick(cfs_rq, curr))
++		return ;
++#endif
+ 	ideal_runtime = sched_slice(cfs_rq, curr);
+ 	delta_exec = curr->sum_exec_runtime - curr->prev_sum_exec_runtime;
+ 	if (delta_exec > ideal_runtime) {
+@@ -3173,7 +3214,11 @@ set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
+ 		 * runqueue.
+ 		 */
+ 		update_stats_wait_end(cfs_rq, se);
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++		check_dequeue_entity(cfs_rq, se);
++#else
+ 		__dequeue_entity(cfs_rq, se);
++#endif
+ 		update_load_avg(se, 1);
+ 	}
+ 
+@@ -3208,6 +3253,7 @@ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ {
+ 	struct sched_entity *left = __pick_first_entity(cfs_rq);
+ 	struct sched_entity *se;
++	struct sched_entity *rse;
+ 
+ 	/*
+ 	 * If curr is set we have to see if its left of the leftmost entity
+@@ -3237,6 +3283,26 @@ pick_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+ 			se = second;
+ 	}
+ 
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++	rse = __pick_first_reserve_entity(cfs_rq);
++	if (rse != NULL)
++		return rse;
++/*
++ 	if (rse != NULL) {
++		se = rse;
++
++		if (cfs_rq->last && wakeup_preempt_entity(cfs_rq->last, rse) < 1)
++			se = cfs_rq->last;
++
++		if (cfs_rq->next && wakeup_preempt_entity(cfs_rq->next, rse) < 1)
++			se = cfs_rq->next;
++
++		clear_buddies(cfs_rq, se);
++
++		return se;
++	}
++*/
++#endif
+ 	/*
+ 	 * Prefer last buddy, try to return the CPU to a preempted task.
+ 	 */
+@@ -3268,11 +3334,18 @@ static void put_prev_entity(struct cfs_rq *cfs_rq, struct sched_entity *prev)
+ 	/* throttle cfs_rqs exceeding runtime */
+ 	check_cfs_rq_runtime(cfs_rq);
+ 
++	/* throttle cfs_rq exceeding reserved time */
++	check_cfs_rq_reserve_runtime(cfs_rq);
++
+ 	check_spread(cfs_rq, prev);
+ 	if (prev->on_rq) {
+ 		update_stats_wait_start(cfs_rq, prev);
+ 		/* Put 'current' back into the tree. */
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++		check_enqueue_entity(cfs_rq, prev, ENQUEUE_WAKEUP);
++#else
+ 		__enqueue_entity(cfs_rq, prev);
++#endif
+ 		/* in !on_rq case, update occurred at dequeue */
+ 		update_load_avg(prev, 0);
+ 	}
+@@ -3321,6 +3394,35 @@ entity_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr, int queued)
+ 
+ #ifdef CONFIG_CFS_BANDWIDTH
+ 
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++#ifdef HAVE_JUMP_LABEL
++static struct static_key __cfs_reserve_bandwidth_used;
++
++bool cfs_reserve_bandwidth_used(void)
++{
++	return static_key_false(&__cfs_reserve_bandwidth_used);
++}
++
++void cfs_reserve_bandwidth_usage_inc(void)
++{
++	static_key_slow_inc(&__cfs_reserve_bandwidth_used);
++}
++
++void cfs_reserve_bandwidth_usage_dec(void)
++{
++	static_key_slow_dec(&__cfs_reserve_bandwidth_used);
++}
++#else /* HAVE_JUMP_LABEL */
++bool cfs_reserve_bandwidth_used(void)
++{
++	return true;
++}
++
++void cfs_reserve_bandwidth_usage_inc(void) {}
++void cfs_reserve_bandwidth_usage_dec(void) {}
++#endif /* HAVE_JUMP_LABEL */
++#endif /* CONFIG_CFS_RESERVED_BANDWIDTH */
++
+ #ifdef HAVE_JUMP_LABEL
+ static struct static_key __cfs_bandwidth_used;
+ 
+@@ -3606,6 +3708,59 @@ static void throttle_cfs_rq(struct cfs_rq *cfs_rq)
+ 	raw_spin_unlock(&cfs_b->lock);
+ }
+ 
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
++{
++	struct rq *rq = rq_of(cfs_rq);
++	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
++	struct sched_entity *se;
++	int enqueue = 1;
++	long task_delta;
++
++	se = cfs_rq->tg->se[cpu_of(rq)];
++
++	update_rq_clock(rq);
++
++	if (cfs_rq->throttled) {
++		raw_spin_lock(&cfs_b->lock);
++		cfs_b->throttled_time += rq_clock(rq) - cfs_rq->throttled_clock;
++		list_del_rcu(&cfs_rq->throttled_list);
++		raw_spin_unlock(&cfs_b->lock);
++
++		/* update hierarchical throttle state */
++		walk_tg_tree_from(cfs_rq->tg, tg_nop, tg_unthrottle_up, (void *)rq);
++	}
++
++	cfs_rq->throttled = 0;
++
++	if (!cfs_rq->load.weight)
++		return;
++
++	task_delta = cfs_rq->h_nr_running;
++	for_each_sched_entity(se) {
++		if (se->on_rq)
++			enqueue = 0;
++
++		cfs_rq = cfs_rq_of(se);
++		if (enqueue)
++			enqueue_entity(cfs_rq, se, ENQUEUE_WAKEUP);
++		cfs_rq->h_nr_running += task_delta;
++
++		if (cfs_rq_throttled(cfs_rq))
++			break;
++
++		if (reserve_cfs_rq_throttled(cfs_rq))
++			break;
++	}
++
++	if (!se)
++		add_nr_running(rq, task_delta);
++
++	/* determine whether we need to wake up potentially idle cpu */
++	if (rq->curr == rq->idle && rq->cfs.nr_running)
++		resched_curr(rq);
++}
++#else
+ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
+ {
+ 	struct rq *rq = rq_of(cfs_rq);
+@@ -3652,6 +3807,7 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
+ 	if (rq->curr == rq->idle && rq->cfs.nr_running)
+ 		resched_curr(rq);
+ }
++#endif
+ 
+ static u64 distribute_cfs_runtime(struct cfs_bandwidth *cfs_b,
+ 		u64 remaining, u64 expires)
+@@ -3926,6 +4082,10 @@ static enum hrtimer_restart sched_cfs_slack_timer(struct hrtimer *timer)
+ 	struct cfs_bandwidth *cfs_b =
+ 		container_of(timer, struct cfs_bandwidth, slack_timer);
+ 
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++	if (check_cfs_bandwidth_reserve_enabled(cfs_b))
++		return HRTIMER_NORESTART;
++#endif
+ 	do_sched_cfs_slack_timer(cfs_b);
+ 
+ 	return HRTIMER_NORESTART;
+@@ -3938,6 +4098,10 @@ static enum hrtimer_restart sched_cfs_period_timer(struct hrtimer *timer)
+ 	int overrun;
+ 	int idle = 0;
+ 
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++	if (check_cfs_bandwidth_reserve_enabled(cfs_b))
++		return HRTIMER_NORESTART;
++#endif
+ 	raw_spin_lock(&cfs_b->lock);
+ 	for (;;) {
+ 		overrun = hrtimer_forward_now(timer, cfs_b->period);
+@@ -3965,12 +4129,20 @@ void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+ 	cfs_b->period_timer.function = sched_cfs_period_timer;
+ 	hrtimer_init(&cfs_b->slack_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	cfs_b->slack_timer.function = sched_cfs_slack_timer;
++
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++	init_cfs_reserve_bandwidth(cfs_b);
++#endif
+ }
+ 
+ static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ {
+ 	cfs_rq->runtime_enabled = 0;
+ 	INIT_LIST_HEAD(&cfs_rq->throttled_list);
++
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++	init_cfs_rq_reserve_runtime(cfs_rq);
++#endif
+ }
+ 
+ void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+@@ -4031,6 +4203,605 @@ static void __maybe_unused unthrottle_offline_cfs_rqs(struct rq *rq)
+ 	}
+ }
+ 
++/**************************************************
++ * CFS reserved bandwidth control machinery
++ */
++
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++static void init_cfs_rq_reserve_runtime(struct cfs_rq *cfs_rq)
++{
++	struct task_group *tg = cfs_rq->tg;
++
++	cfs_rq->reserve_enabled = 0;
++	cfs_rq->reserve_remaining = 0;
++	cfs_rq->reserve_expires = 0;
++	cfs_rq->inactive_count = 0;
++
++	INIT_LIST_HEAD(&cfs_rq->reserve_throttled_list);
++
++	if (tg == &root_task_group)
++		return ;
++
++	hrtimer_init(&cfs_rq->reserve_period_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_PINNED);
++	cfs_rq->reserve_period_timer.function = sched_cfs_rq_reserve_period_timer;
++}
++
++static void init_cfs_reserve_bandwidth(struct cfs_bandwidth *cfs_b)
++{
++	cfs_b->reserve_period = ns_to_ktime(default_cfs_period());
++	cfs_b->reserve = RESERVE_INF;
++	cfs_b->reserve_enabled = 0;
++
++	cfs_b->total_children_reserve = 0;
++	cfs_b->normalize_reserve = 0;
++
++	INIT_LIST_HEAD(&cfs_b->throttled_cfs_rq_reserve);
++}
++
++static inline int reserve_cfs_rq_throttled(struct cfs_rq *cfs_rq)
++{
++	return cfs_reserve_bandwidth_used() && cfs_rq->reserve_throttled;
++}
++
++static inline int check_cfs_bandwidth_reserve_enabled(struct cfs_bandwidth *cfs_b)
++{
++	return cfs_reserve_bandwidth_used() && cfs_b->reserve_enabled;
++}
++
++static void destroy_cfs_reserve_bandwidth(struct task_group *tg, int cpu)
++{
++	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++	struct cfs_bandwidth *pcfs_b = &tg->parent->cfs_bandwidth;
++	struct cfs_rq *cfs_rq = tg->cfs_rq[cpu];
++
++	if (tg != &root_task_group)
++		hrtimer_cancel(&cfs_rq->reserve_period_timer);
++
++	if (cfs_b->reserve == RESERVE_INF)
++		return ;
++
++	raw_spin_lock(&pcfs_b->lock);
++	pcfs_b->total_children_reserve -= cfs_b->normalize_reserve;
++	raw_spin_unlock(&pcfs_b->lock);
++
++	return ;
++}
++
++static void unthrottle_reserve_cfs_rq(struct cfs_rq *cfs_rq)
++{
++	struct rq *rq = rq_of(cfs_rq);
++	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
++	struct sched_entity *se;
++	int task_delta, enqueue = 1, flags = ENQUEUE_REPLENISH;
++
++	se = cfs_rq->tg->se[cpu_of(rq)];
++
++	update_rq_clock(rq);
++
++	if (cfs_rq->reserve_throttled) {
++		raw_spin_lock(&cfs_b->lock);
++		list_del_rcu(&cfs_rq->reserve_throttled_list);
++		raw_spin_unlock(&cfs_b->lock);
++
++		cfs_rq->reserve_throttled = 0;
++	}
++
++	if (!cfs_rq->load.weight)
++		return ;
++
++	task_delta = cfs_rq->h_nr_running;
++	for_each_sched_entity(se) {
++		struct cfs_rq *qcfs_rq = cfs_rq_of(se);
++
++		if (se->on_rq)
++			enqueue = 0;
++
++		if (enqueue)
++			enqueue_entity(qcfs_rq, se, flags);
++		qcfs_rq->h_nr_running += task_delta;
++
++		if (reserve_cfs_rq_throttled(cfs_rq))
++			break;
++
++		flags = ENQUEUE_WAKEUP;
++	}
++
++	if (!se) {
++		add_nr_running(rq, task_delta);
++		resched_curr(rq);
++	}
++
++	return ;
++}
++
++static void throttle_reserve_cfs_rq(struct cfs_rq *cfs_rq)
++{
++	struct rq *rq = rq_of(cfs_rq);
++	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
++	struct sched_entity *se;
++	int task_delta, dequeue = 1, start;
++
++	se = cfs_rq->tg->se[cpu_of(rq)];
++
++	task_delta = cfs_rq->h_nr_running;
++	for_each_sched_entity(se) {
++		struct cfs_rq *qcfs_rq = cfs_rq_of(se);
++
++		if (!se->on_rq)
++			break;
++
++		if (dequeue)
++			dequeue_entity(qcfs_rq, se, DEQUEUE_SLEEP);
++		qcfs_rq->h_nr_running -= task_delta;
++
++		if (qcfs_rq->load.weight)
++			dequeue = 0;
++	}
++
++	if (!se)
++		sub_nr_running(rq, task_delta);
++
++	cfs_rq->reserve_throttled = 1;
++
++	start = start_cfs_rq_reserve_period_timer(cfs_rq);
++	raw_spin_lock(&cfs_b->lock);
++	list_add_rcu(&cfs_rq->reserve_throttled_list, &cfs_b->throttled_cfs_rq_reserve);
++	raw_spin_unlock(&cfs_b->lock);
++
++	if (!start) {
++		cfs_rq->inactive_count++;
++		unthrottle_reserve_cfs_rq(cfs_rq);
++	}
++
++	return ;
++}
++
++static enum hrtimer_restart sched_cfs_rq_reserve_period_timer(struct hrtimer *timer)
++{
++	struct cfs_rq *cfs_rq =
++		container_of(timer, struct cfs_rq, reserve_period_timer);
++	struct task_group *tg = cfs_rq->tg;
++	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++	struct rq *rq = rq_of(cfs_rq);
++
++	if (!check_cfs_bandwidth_reserve_enabled(cfs_b))
++		return HRTIMER_NORESTART;
++
++	if (list_empty(&cfs_b->throttled_cfs_rq_reserve))
++		return HRTIMER_NORESTART;
++
++	if (cfs_rq->reserve_throttled) {
++		raw_spin_lock(&rq->lock);
++		unthrottle_reserve_cfs_rq(cfs_rq);
++		raw_spin_unlock(&rq->lock);
++	}
++
++	return HRTIMER_NORESTART;
++}
++
++static int start_cfs_rq_reserve_period_timer(struct cfs_rq *cfs_rq)
++{
++	struct hrtimer *timer = &cfs_rq->reserve_period_timer;
++	struct rq *rq = rq_of(cfs_rq);
++	ktime_t expire, now;
++	s64 delta;
++
++	expire = ns_to_ktime(cfs_rq->reserve_expires);
++	now = hrtimer_cb_get_time(timer);
++	delta = ktime_to_ns(now) - rq_clock(rq);
++	expire = ktime_add_ns(expire, delta);
++
++	if (ktime_us_delta(expire, now) < 0)
++		return 0;
++
++	hrtimer_start(&cfs_rq->reserve_period_timer, expire, HRTIMER_MODE_ABS_PINNED);
++
++	return 1;
++}
++
++struct sched_entity *__pick_first_reserve_entity(struct cfs_rq *cfs_rq)
++{
++	struct rb_node *left = cfs_rq->reserve_leftmost;
++
++	if (!left)
++		return NULL;
++
++	return rb_entry(left, struct sched_entity, reserve_node);
++}
++
++static void check_enqueue_reserve_throttle(struct cfs_rq *cfs_rq)
++{
++	if (!cfs_reserve_bandwidth_used())
++		return ;
++
++	if (!cfs_rq->reserve_enabled || cfs_rq->curr)
++		return ;
++
++	if (reserve_cfs_rq_throttled(cfs_rq))
++		return ;
++
++	account_cfs_rq_reserve_runtime(cfs_rq, 0);
++	if (cfs_rq->reserve_remaining <= 0)
++		throttle_reserve_cfs_rq(cfs_rq);
++
++	return ;
++}
++static bool check_cfs_rq_reserve_runtime(struct cfs_rq *cfs_rq)
++{
++	if (!cfs_reserve_bandwidth_used())
++		return false;
++
++	if (likely(!cfs_rq->reserve_enabled || cfs_rq->reserve_remaining > 0))
++		return false;
++
++	if (reserve_cfs_rq_throttled(cfs_rq))
++		return true;
++
++	throttle_reserve_cfs_rq(cfs_rq);
++	return true;
++}
++
++static int check_reserve_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
++{
++	struct cfs_rq *gcfs_rq;
++
++	if (!cfs_reserve_bandwidth_used())
++		return 0;
++
++	if (entity_is_task(curr))
++		return 0;
++
++	gcfs_rq = group_cfs_rq(curr);
++	if (!gcfs_rq->reserve_enabled)
++		return 0;
++
++	if (likely(gcfs_rq->reserve_remaining > 0))
++		return 1;
++
++	//resched_curr(rq_of(cfs_rq));
++	return 0;
++}
++
++static void __dequeue_reserve_entity(struct cfs_rq *cfs_rq,
++                struct sched_entity *se)
++{
++	if (cfs_rq->reserve_leftmost == &se->reserve_node) {
++		struct rb_node *next_node;
++
++		next_node = rb_next(&se->reserve_node);
++		cfs_rq->reserve_leftmost = next_node;
++	}
++
++	rb_erase(&se->reserve_node, &cfs_rq->reserve_root);
++}
++
++static void check_dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
++{
++	struct cfs_rq *gcfs_rq;
++
++	if (!cfs_reserve_bandwidth_used() || entity_is_task(se))
++		return __dequeue_entity(cfs_rq, se);
++
++	gcfs_rq = group_cfs_rq(se);
++	if (likely(!gcfs_rq->reserve_enabled))
++		return __dequeue_entity(cfs_rq, se);
++
++	se->reserve_on_rq = 0;
++	return __dequeue_reserve_entity(cfs_rq, se);
++}
++
++static inline int reserve_expires_before(struct sched_entity *a, struct sched_entity *b)
++{
++	struct cfs_rq *acfs_rq = group_cfs_rq(a);
++	struct cfs_rq *bcfs_rq = group_cfs_rq(b);
++
++	WARN_ON(!acfs_rq || !bcfs_rq);
++
++	return (s64)(acfs_rq->reserve_expires - bcfs_rq->reserve_expires) < 0;
++}
++
++/*
++ * Enqueue an reserved entity into the reserve rb-tree
++ */
++static void __enqueue_reserve_entity(struct cfs_rq *cfs_rq,
++                        struct sched_entity *res_se)
++{
++	struct rb_node **link = &cfs_rq->reserve_root.rb_node;
++	struct rb_node *parent = NULL;
++	struct sched_entity *entry;
++	int leftmost = 1;
++
++	while (*link) {
++		parent = *link;
++		entry = rb_entry(parent, struct sched_entity, reserve_node);
++
++		/*
++		 * priority : EDF
++		 */
++		if (reserve_expires_before(res_se, entry)) {
++			link = &parent->rb_left;
++		} else {
++			link = &parent->rb_right;
++			leftmost = 0;
++		}
++	}
++
++	if (leftmost)
++		cfs_rq->reserve_leftmost = &res_se->reserve_node;
++
++	rb_link_node(&res_se->reserve_node, parent, link);
++	rb_insert_color(&res_se->reserve_node, &cfs_rq->reserve_root);
++}
++
++
++static void replenish_cfs_rq_reserve(struct cfs_rq *cfs_rq)
++{
++	struct task_group *tg = cfs_rq->tg;
++	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++	struct rq *rq = rq_of(cfs_rq);
++
++	/* initalized reserve subsystem by cgroup filesystem */
++	if (cfs_rq->reserve_expires == 0) {
++		cfs_rq->reserve_remaining = cfs_b->reserve;
++		cfs_rq->reserve_expires = rq_clock(rq) + ktime_to_ns(cfs_b->reserve_period);
++		return ;
++	}
++
++	while (cfs_rq->reserve_remaining <= 0) {
++		cfs_rq->reserve_remaining += cfs_b->reserve;
++		cfs_rq->reserve_expires += ktime_to_ns(cfs_b->reserve_period);
++	}
++
++	if (cfs_rq->reserve_expires < rq_clock(rq)) {
++		cfs_rq->reserve_remaining = cfs_b->reserve;
++		cfs_rq->reserve_expires = rq_clock(rq) + ktime_to_ns(cfs_b->reserve_period);
++	}
++	return ;
++}
++
++static bool reserve_entity_overflow(struct cfs_bandwidth *cfs_b, struct cfs_rq *cfs_rq, u64 now)
++{
++	u64 left, right;
++	s64 remaining = cfs_rq->reserve_remaining;
++
++	if (remaining <= 0)
++		return true;
++
++	left = (remaining >> RESERVE_PRECISION) *
++			(ktime_to_ns(cfs_b->reserve_period) >> RESERVE_PRECISION);
++	right = ((cfs_rq->reserve_expires - now) >> RESERVE_PRECISION) *
++			(cfs_b->reserve >> RESERVE_PRECISION);
++
++	return left > right;
++}
++
++static void update_cfs_rq_reserve(struct cfs_rq *cfs_rq)
++{
++	struct task_group *tg = cfs_rq->tg;
++	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++	struct rq *rq = rq_of(cfs_rq);
++
++	if (cfs_rq->reserve_expires < rq_clock(rq) ||
++		reserve_entity_overflow(cfs_b, cfs_rq, rq_clock(rq))) {
++		cfs_rq->reserve_expires = rq_clock(rq) + ktime_to_ns(cfs_b->reserve_period);
++		cfs_rq->reserve_remaining = cfs_b->reserve;
++	}
++}
++
++static void enqueue_reserve_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
++{
++	/*
++	 * update_cfs_rq_reserve and replenish_cfs_rq_reserve implement
++	 * Constant Bandwidth Server algorithm
++	 */
++	struct cfs_rq *my_q = group_cfs_rq(se);
++
++	if (flags & ENQUEUE_WAKEUP)
++		update_cfs_rq_reserve(my_q);
++	else if (flags & ENQUEUE_REPLENISH)
++		replenish_cfs_rq_reserve(my_q);
++
++	se->reserve_on_rq = 1;
++	return __enqueue_reserve_entity(cfs_rq, se);
++}
++
++static void check_enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
++{
++	struct cfs_rq *my_q;
++
++	if (!cfs_reserve_bandwidth_used() || entity_is_task(se))
++		return __enqueue_entity(cfs_rq, se);
++
++	my_q = group_cfs_rq(se);
++	if (likely(!my_q->reserve_enabled))
++		return __enqueue_entity(cfs_rq, se);
++
++	return enqueue_reserve_entity(cfs_rq, se, flags);
++}
++
++static void __account_cfs_rq_reserve_runtime(struct cfs_rq *cfs_rq, u64 delta_exec)
++{
++
++	cfs_rq->reserve_remaining -= delta_exec;
++	if (likely(cfs_rq->reserve_remaining > 0))
++		return ;
++
++	if (likely(cfs_rq->curr))
++		resched_curr(rq_of(cfs_rq));
++	return ;
++}
++
++static void account_cfs_rq_reserve_runtime(struct cfs_rq *cfs_rq, u64 delta_exec)
++{
++	if (!cfs_reserve_bandwidth_used() || !cfs_rq->reserve_enabled)
++		return ;
++
++	__account_cfs_rq_reserve_runtime(cfs_rq, delta_exec);
++}
++
++void from_original_to_reserve(struct task_group *tg)
++{
++	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++	struct sched_entity *se = tg->se[0];
++	struct cfs_rq *cfs_rq = tg->cfs_rq[0];
++	struct cfs_rq *pcfs_rq = cfs_rq_of(se);
++	struct rq *rq = rq_of(cfs_rq);
++	int periods, throttled;
++
++	/* account and disable bwc */
++	raw_spin_lock_irq(&cfs_b->lock);
++	periods = hrtimer_forward_now(&cfs_b->period_timer, cfs_b->period);
++	if (periods) {
++		cfs_b->nr_periods += periods;
++
++		throttled = !list_empty(&cfs_b->throttled_cfs_rq);
++		if (throttled)
++			cfs_b->nr_throttled += periods;
++	}
++	raw_spin_unlock_irq(&cfs_b->lock);
++
++	cfs_rq->runtime_enabled = 0;
++	cfs_rq->runtime_remaining = 0;
++
++	/* enable rcbw */
++	cfs_rq->reserve_enabled = 1;
++	cfs_rq->reserve_remaining = 0;
++
++	/*
++	 * transfering runqueue from the origin runqueue to the reserve runqueue
++	 * 1) se is running on CPU
++	 * 2) se is in the origin runqueue
++	 * 3) se is not in the origin runqueue
++	 *      a. may be throttled by bwc
++	 *      b. may be sleeping
++	 */
++	raw_spin_lock_irq(&rq->lock);
++	if (!cfs_rq->load.weight) {
++		pr_info("RCBW: o->r: the cfs_rq don't have any se\n");
++		goto out_transform;
++	}
++
++	if (pcfs_rq->curr == se) {
++		pr_info("RCBW: o->r:the se is running on CPU\n");
++		se->enqueue_mode = 1;
++		se->reserve_on_rq = 1;
++
++		replenish_cfs_rq_reserve(cfs_rq);
++		goto out_transform;
++	}
++
++	if (se->on_rq) {
++		pr_info("RCBW: o->r:the se is in the runqueue\n");
++		se->enqueue_mode = 2;
++
++		__dequeue_entity(pcfs_rq, se);
++		enqueue_reserve_entity(pcfs_rq, se, ENQUEUE_REPLENISH);
++		resched_curr(rq);
++		goto out_transform;
++	}
++
++	if (cfs_rq->throttled) {
++		pr_info("RCBW: o->r:the se is throttled and is not in the runqueue\n");
++		se->enqueue_mode = 3;
++
++		cfs_rq->throttled = 0;
++		raw_spin_lock(&cfs_b->lock);
++		cfs_b->throttled_time += rq_clock(rq)-cfs_rq->throttled_clock;
++		list_del_rcu(&cfs_rq->throttled_list);
++		raw_spin_unlock(&cfs_b->lock);
++
++		walk_tg_tree_from(cfs_rq->tg, tg_nop, tg_unthrottle_up, (void *)rq);
++
++		unthrottle_reserve_cfs_rq(cfs_rq);
++	} else {
++		pr_info("RCBW: o->r:the se isn't throttled as well as the this se isn't in the runqueue\n");
++		se->enqueue_mode = 4;
++	}
++
++out_transform:
++	raw_spin_unlock_irq(&rq->lock);
++
++	return ;
++}
++
++void from_reserve_to_original(struct task_group *tg)
++{
++	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++	struct sched_entity *se = tg->se[0];
++	struct cfs_rq *cfs_rq = tg->cfs_rq[0];
++	struct cfs_rq *pcfs_rq = cfs_rq_of(se);
++	struct rq *rq = rq_of(cfs_rq);
++
++	se->reserve_on_rq = 0;
++
++	raw_spin_lock_irq(&rq->lock);
++	/* disable rcbw */
++	cfs_rq->reserve_enabled = 0;
++	cfs_rq->reserve_remaining = 0;
++	cfs_rq->reserve_expires = 0;
++
++	/*
++	 * tg_set_cfs_bandwidth has forbidden that quota == RUNTIME_INF,
++	 * so bwc must be enabled.
++	 */
++	cfs_rq->runtime_enabled = 1;
++	cfs_rq->runtime_remaining = 0;
++
++	if (!cfs_rq->load.weight) {
++		pr_info("RCBW: r->o:the cfs_rq don't have any se\n");
++
++		goto out_transform;
++	}
++
++	if (pcfs_rq->curr == se) {
++		pr_info("RCBW: r->o:the reserve se is running on CPU\n");
++
++		goto out_transform;
++	}
++
++	if (se->on_rq) {
++		pr_info("RCBW: r->o:the reserve se is on runqueue\n");
++
++		__dequeue_reserve_entity(pcfs_rq, se);
++		__enqueue_entity(pcfs_rq, se);
++		goto out_transform;
++	}
++
++	if (cfs_rq->reserve_throttled) {
++		pr_info("RCBW: r->o:the se is reserve-throttled and unthrotting instantly\n");
++
++		cfs_rq->reserve_throttled = 0;
++		raw_spin_lock(&cfs_b->lock);
++		list_del_rcu(&cfs_rq->reserve_throttled_list);
++		raw_spin_unlock(&cfs_b->lock);
++
++		unthrottle_cfs_rq(cfs_rq);
++	} else {
++		pr_info("RCBW: r->o:the se isn't reserve-throttled as well as the this se isn't in the runqueue\n");
++		se->reserve_on_rq = 0;
++	}
++
++out_transform:
++	raw_spin_unlock_irq(&rq->lock);
++
++	/* replenish runtime according bwc and restart the period timer */
++	raw_spin_lock_irq(&cfs_b->lock);
++	__refill_cfs_bandwidth_runtime(cfs_b);
++
++	/* may be period_active = 1 so that don't restart the bwc period timer */
++	cfs_b->period_active = 0;
++	start_cfs_bandwidth(cfs_b);
++	raw_spin_unlock_irq(&cfs_b->lock);
++
++	return ;
++}
++#else
++static inline void account_cfs_rq_reserve_runtime(struct cfs_rq *cfs_rq, u64 delta_exec)
++{
++	return ;
++}
++#endif
++
+ #else /* CONFIG_CFS_BANDWIDTH */
+ static inline u64 cfs_rq_clock_task(struct cfs_rq *cfs_rq)
+ {
+@@ -4151,6 +4922,10 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 		*/
+ 		if (cfs_rq_throttled(cfs_rq))
+ 			break;
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++		if (reserve_cfs_rq_throttled(cfs_rq))
++			break;
++#endif
+ 		cfs_rq->h_nr_running++;
+ 
+ 		flags = ENQUEUE_WAKEUP;
+@@ -4162,6 +4937,10 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 
+ 		if (cfs_rq_throttled(cfs_rq))
+ 			break;
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++		if (reserve_cfs_rq_throttled(cfs_rq))
++			break;
++#endif
+ 
+ 		update_load_avg(se, 1);
+ 		update_cfs_shares(cfs_rq);
+@@ -4198,6 +4977,10 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 		*/
+ 		if (cfs_rq_throttled(cfs_rq))
+ 			break;
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++		if (reserve_cfs_rq_throttled(cfs_rq))
++			break;
++#endif
+ 		cfs_rq->h_nr_running--;
+ 
+ 		/* Don't dequeue parent if it has other entities besides us */
+@@ -4222,6 +5005,10 @@ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 
+ 		if (cfs_rq_throttled(cfs_rq))
+ 			break;
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++		if (reserve_cfs_rq_throttled(cfs_rq))
++			break;
++#endif
+ 
+ 		update_load_avg(se, 1);
+ 		update_cfs_shares(cfs_rq);
+@@ -5198,7 +5985,7 @@ static struct task_struct *
+ pick_next_task_fair(struct rq *rq, struct task_struct *prev)
+ {
+ 	struct cfs_rq *cfs_rq = &rq->cfs;
+-	struct sched_entity *se;
++	struct sched_entity *se = NULL;
+ 	struct task_struct *p;
+ 	int new_tasks;
+ 
+@@ -5241,6 +6028,13 @@ again:
+ 			 */
+ 			if (unlikely(check_cfs_rq_runtime(cfs_rq)))
+ 				goto simple;
++
++			if (unlikely(check_cfs_rq_reserve_runtime(cfs_rq))) {
++				if (!se)
++					cfs_rq = &rq->cfs;
++				else
++					cfs_rq = cfs_rq_of(se);
++			}
+ 		}
+ 
+ 		se = pick_next_entity(cfs_rq, curr);
+@@ -8066,6 +8860,9 @@ static void set_curr_task_fair(struct rq *rq)
+ void init_cfs_rq(struct cfs_rq *cfs_rq)
+ {
+ 	cfs_rq->tasks_timeline = RB_ROOT;
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++	cfs_rq->reserve_root = RB_ROOT;
++#endif
+ 	cfs_rq->min_vruntime = (u64)(-(1LL << 20));
+ #ifndef CONFIG_64BIT
+ 	cfs_rq->min_vruntime_copy = cfs_rq->min_vruntime;
+@@ -8096,6 +8893,11 @@ void free_fair_sched_group(struct task_group *tg)
+ 	destroy_cfs_bandwidth(tg_cfs_bandwidth(tg));
+ 
+ 	for_each_possible_cpu(i) {
++
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++		destroy_cfs_reserve_bandwidth(tg, i);
++#endif
++
+ 		if (tg->cfs_rq)
+ 			kfree(tg->cfs_rq[i]);
+ 		if (tg->se) {
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index b242775..a906727 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -84,6 +84,19 @@ static inline void update_cpu_load_active(struct rq *this_rq) { }
+  */
+ #define RUNTIME_INF	((u64)~0ULL)
+ 
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++
++#define RESERVE_INF ((u64)~0ULL)
++#define RESERVE_PRECISION (10)
++
++extern void cfs_reserve_bandwidth_usage_dec(void);
++extern void cfs_reserve_bandwidth_usage_inc(void);
++extern bool cfs_reserve_bandwidth_used(void);
++
++extern void from_original_to_reserve(struct task_group *tg);
++extern void from_reserve_to_original(struct task_group *tg);
++#endif
++
+ static inline int idle_policy(int policy)
+ {
+ 	return policy == SCHED_IDLE;
+@@ -233,6 +246,18 @@ struct cfs_bandwidth {
+ 	/* statistics */
+ 	int nr_periods, nr_throttled;
+ 	u64 throttled_time;
++
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++	ktime_t reserve_period;
++	u64 reserve;
++	unsigned int reserve_enabled;
++
++	u64 normalize_reserve;
++	unsigned long total_children_reserve;
++
++	struct list_head throttled_cfs_rq_reserve;
++#endif
++
+ #endif
+ };
+ 
+@@ -419,6 +444,20 @@ struct cfs_rq {
+ 	u64 throttled_clock_task_time;
+ 	int throttled, throttle_count;
+ 	struct list_head throttled_list;
++#ifdef CONFIG_CFS_RESERVED_BANDWIDTH
++	/* reserve runqueue nested the origin cfs_rq */
++	struct rb_root reserve_root;
++	struct rb_node *reserve_leftmost;
++
++	int reserve_enabled;
++	s64 reserve_remaining;
++	u64 reserve_expires;
++
++	int inactive_count;
++	struct hrtimer reserve_period_timer;
++	int reserve_throttled;
++	struct list_head reserve_throttled_list;
++#endif /* CONFIG_CFS_RESERVED_BANDWIDTH */
+ #endif /* CONFIG_CFS_BANDWIDTH */
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+ };
+-- 
+2.7.4
+
